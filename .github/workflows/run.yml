@@ -1,0 +1,102 @@
+name: rakutenjp-beauty-rank
+
+on:
+  schedule:
+    - cron: "11 4 * * *" # 매일 KST 11:11 (UTC 04:11)
+  workflow_dispatch:
+
+concurrency:
+  group: rakutenjp-beauty-rank
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+      # 동작 옵션
+      RAKUTEN_MAX_RANK: "160"         # 1~160위까지
+      SLACK_TRANSLATE_JA2KO: "1"      # 일본어 1줄 번역 (끄려면 0)
+
+      # 시크릿(필수)
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.46.0
+          pip install beautifulsoup4 lxml requests pandas
+          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          # ✅ Google Drive 업로드에 필수
+          pip install -U packaging
+          # 번역 백엔드 2종
+          pip install googletrans==4.0.0rc1 deep-translator
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
+
+      # ✅ 드라이브/슬랙 시크릿이 제대로 들어왔는지 빠르게 확인
+      - name: Preflight check (secrets & imports)
+        run: |
+          python - << 'PY'
+          import os, importlib, sys
+          keys = [
+              "GDRIVE_FOLDER_ID",
+              "GOOGLE_CLIENT_ID",
+              "GOOGLE_CLIENT_SECRET",
+              "GOOGLE_REFRESH_TOKEN",
+              "SLACK_WEBHOOK_URL",
+          ]
+          print("== Secret presence ==")
+          for k in keys:
+              v = os.getenv(k)
+              print(f"{k:20}:", "SET" if v else "MISSING", "| len =", (len(v) if v else 0))
+          print("\n== Python deps check ==")
+          for m in ["googleapiclient.discovery","google.api_core","packaging.version"]:
+              try:
+                  importlib.import_module(m)
+                  print(m, "OK")
+              except Exception as e:
+                  print(m, "FAIL:", e); sys.exit(1)
+          PY
+
+      - name: Run rakuten app.py
+        run: |
+          echo "[INFO] 라쿠텐 뷰티 랭킹 수집 시작"
+          python app.py
+
+      - name: Upload CSV artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-${{ github.run_id }}
+          path: data/*.csv
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: Upload debug files (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: data/debug/**
+          if-no-files-found: warn
+          compression-level: 6
