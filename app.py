@@ -1,293 +1,327 @@
-# -*- coding: utf-8 -*-
-import os, re, io, time, traceback, datetime as dt
-from typing import List, Dict, Optional
+# app.py — 라쿠텐 재팬 '뷰티/코스메/향수(100939)' 데일리 Top160 (1~80, 81~160)
+# 요구사항:
+#  - ScraperAPI(country=jp, render=true)로 렌더링된 DOM 수집
+#  - 전일 비교 = 제품명 기준(정확 일치)
+#  - 변동없음은 '-' 로 표기
+#  - "↔ 랭크 인&아웃" 섹션 문구 고정
+#  - 슬랙 포맷은 기존 큐텐 포맷 유지
 
-import requests
+import os, io, re, sys, time, json, math, shutil, datetime as dt
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
-import pytz
 
-# ================= 기본 설정 =================
-KST = pytz.timezone("Asia/Seoul")
-def now_kst(): return dt.datetime.now(KST)
-def today(): return now_kst().strftime("%Y-%m-%d")
-def yesterday(): return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
-def build_filename(d): return f"라쿠텐재팬_뷰티_랭킹_{d}.csv"
-def clean(s: str) -> str: return re.sub(r"\s+", " ", (s or "")).strip()
-def slack_escape(s: str) -> str: return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+# -----------------------
+# 공통 설정
+# -----------------------
+KST = dt.timezone(dt.timedelta(hours=9))
+TODAY = dt.datetime.now(KST).date()
+YMD = TODAY.strftime("%Y-%m-%d")
 
-MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
-FORCE_RENDER = os.getenv("RAKUTEN_FORCE_RENDER", "0") in ("1","true","True")
-SAVE_DEBUG = os.getenv("RAKUTEN_SAVE_DEBUG", "1") in ("1","true","True")
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DBG_DIR  = os.path.join(DATA_DIR, "debug")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DBG_DIR, exist_ok=True)
 
-RANK_URLS = [
+# 입력 URL(1~80, 81~160)
+PAGE_URLS = [
     "https://ranking.rakuten.co.jp/daily/100939/",
     "https://ranking.rakuten.co.jp/daily/100939/p=2/",
 ]
 
-# ================= Slack =================
-def slack_post(text: str):
-    url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url:
-        print("[Slack 미설정]", text[:2000])
+MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
+
+# Slack & Drive
+SLACK_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL", "")
+TRANSLATE_JA2KO     = os.getenv("SLACK_TRANSLATE_JA2KO", "1") == "1"
+
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
+GDRIVE_FOLDER_ID     = os.getenv("GDRIVE_FOLDER_ID")
+
+# ScraperAPI
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
+if not SCRAPERAPI_KEY:
+    print("[경고] SCRAPERAPI_KEY 가 설정되지 않았습니다. (render=false 체인으로만 시도)")
+
+SESS = requests.Session()
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8,ko;q=0.7",
+}
+
+def scraperapi_get(url: str, render: bool = True, save_prefix: str = "") -> str:
+    """ScraperAPI로 (country=jp) HTML을 가져온다. render=True가 핵심."""
+    try:
+        if SCRAPERAPI_KEY:
+            params = {
+                "api_key": SCRAPERAPI_KEY,
+                "url": url,
+                "country_code": "jp",
+                "render": "true" if render else "false",
+                "keep_headers": "true",
+                "retry_404": "true",
+            }
+            r = SESS.get("https://api.scraperapi.com/", params=params, headers=DEFAULT_HEADERS, timeout=60)
+        else:
+            # 키 없으면 best-effort
+            r = SESS.get(url, headers=DEFAULT_HEADERS, timeout=60, allow_redirects=True)
+        r.raise_for_status()
+        html = r.text
+        if save_prefix:
+            with open(os.path.join(DBG_DIR, f"{save_prefix}.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+        return html
+    except Exception as e:
+        print(f"[HTTP 에러] {url} -> {e}")
+        return ""
+
+# -----------------------
+# 파서(복수 셀렉터 + 백업 정규식)
+# -----------------------
+
+SEL_SETS = [
+    # 1) 흔한 구조: 카드 루트
+    {"card": "div.rnkRanking_item"},
+    # 2) 다른 테마: li 단위
+    {"card": "li[class*='rnkRanking']"},
+    # 3) 백업: data-rnk-*
+    {"card": "div[id^='rnkRanking']"},  # 굉장히 느슨한 백업
+]
+
+def text(el):
+    return re.sub(r"\s+", " ", el.get_text(strip=True)) if el else ""
+
+def pick_one(el, selectors):
+    for sel in selectors:
+        f = el.select_one(sel)
+        if f: return f
+    return None
+
+def parse_cards_with_css(soup: BeautifulSoup):
+    items = []
+    for S in SEL_SETS:
+        cards = soup.select(S["card"])
+        if not cards:
+            continue
+        for c in cards:
+            # 랭크
+            r_el = pick_one(c, [
+                ".rnkRanking_rank", ".rnk_rank", ".rank", "[class*='rank']"
+            ])
+            # 상품명
+            name_el = pick_one(c, [
+                ".rnkRanking_itemName a", ".itemName a", "a.rnkRanking_itemName", "a"
+            ])
+            # 가격(있으면)
+            price_el = pick_one(c, [
+                ".rnkRanking_price", ".price", "[class*='price']"
+            ])
+            rank = text(r_el)
+            name = text(name_el)
+            price = text(price_el) if price_el else ""
+
+            # 최소 필터
+            if not rank or not name:
+                continue
+
+            # rank 텍스트에서 숫자만
+            m = re.search(r"\d+", rank)
+            if not m:
+                continue
+            rank_num = int(m.group(0))
+
+            link = ""
+            if name_el and name_el.has_attr("href"):
+                link = name_el["href"]
+                # 상대경로 보정
+                if link.startswith("/"):
+                    link = "https://ranking.rakuten.co.jp" + link
+
+            items.append({
+                "rank": rank_num,
+                "name": name,
+                "price": price,
+                "url": link
+            })
+        if items:
+            break
+    return items
+
+# 백업: 정규식으로 rank & 이름을 매칭
+RE_RANK = re.compile(r'class="[^"]*rnkRanking_rank[^"]*"[^>]*>\s*([0-9]+)\s*<', re.I)
+RE_NAME = re.compile(r'class="[^"]*rnkRanking_itemName[^"]*".*?<a[^>]*>(.*?)</a>', re.I|re.S)
+
+def parse_cards_backup_regex(html: str):
+    # 아주 보수적 백업 (순서대로 대응)
+    ranks = [int(x) for x in RE_RANK.findall(html)]
+    names = [re.sub(r"\s+", " ", re.sub("<.*?>", "", n)).strip() for n in RE_NAME.findall(html)]
+    items = []
+    for i, r in enumerate(ranks):
+        nm = names[i] if i < len(names) else ""
+        if nm:
+            items.append({"rank": r, "name": nm, "price": "", "url": ""})
+    return items
+
+def fetch_one(url: str, prefix: str):
+    print(f"[Playwright 대체] GET(렌더): {url}")
+    html = scraperapi_get(url, render=True, save_prefix=prefix+"_render")
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    items = parse_cards_with_css(soup)
+    if not items:
+        # 백업: 정규식
+        items = parse_cards_backup_regex(html)
+    print(f"[디버그] {url} -> 파싱 {len(items)}건")
+    return items
+
+# -----------------------
+# 전일 CSV 대비 비교(제품명 기준)
+# -----------------------
+def load_prev_csv(csv_path_today: str) -> pd.DataFrame:
+    # 같은 디렉토리에서 '어제 날짜' 파일 탐색
+    d = os.path.dirname(csv_path_today)
+    yesterday = (TODAY - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    target = os.path.join(d, f"라쿠텐재팬_뷰티_랭킹_{yesterday}.csv")
+    if os.path.exists(target):
+        try:
+            return pd.read_csv(target)
+        except:
+            pass
+    return pd.DataFrame()
+
+def build_sections(df_today: pd.DataFrame, df_prev: pd.DataFrame):
+    # 랭크 변동: 오늘.rank - 어제.rank (제품명 매칭)
+    m = df_today[["rank","name","url","price"]].copy()
+    m["prev_rank"] = None
+    if not df_prev.empty:
+        prev_map = {n: r for r, n in zip(df_prev["rank"], df_prev["name"])}
+        m["prev_rank"] = m["name"].map(prev_map)
+
+    def rank_delta(row):
+        pr = row["prev_rank"]
+        if pd.isna(pr): return None
+        try:
+            return int(pr) - int(row["rank"])
+        except: return None
+
+    m["delta"] = m.apply(rank_delta, axis=1)
+
+    # 변동 텍스트: ↑/↓/-
+    def arrow(d):
+        if d is None: return "-"  # 전일 없음도 '-' 처리(요청사항: 변동없음 표기)
+        if d > 0: return f"↑{abs(d)}"
+        if d < 0: return f"↓{abs(d)}"
+        return "-"
+
+    m["delta_txt"] = m["delta"].apply(arrow)
+
+    # Top10 텍스트 (raw 제품명 그대로)
+    top10 = (m.sort_values("rank").head(10))[["rank","delta_txt","name"]].values.tolist()
+    # IN & OUT: 집합 차이
+    inout = 0
+    if not df_prev.empty:
+        tset = set(m["name"])
+        pset = set(df_prev["name"])
+        ins  = tset - pset
+        outs = pset - tset
+        # 네가 정의한 텍스트 규칙: "인/아웃 개수는 동일" → 보고는 x개
+        inout = max(len(ins), len(outs))
+
+    return m, top10, inout
+
+# -----------------------
+# Slack 전송
+# -----------------------
+def slack_post(lines):
+    if not SLACK_WEBHOOK_URL:
+        print("[경고] SLACK_WEBHOOK_URL 미설정 — 메시지 미전송")
+        return
+    payload = {"text": "\n".join(lines)}
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=15)
+        r.raise_for_status()
+        print("[INFO] 슬랙 전송 OK")
+    except Exception as e:
+        print("[경고] 슬랙 전송 실패:", e)
+
+# -----------------------
+# Google Drive 업로드(선택)
+# -----------------------
+def upload_gdrive(local_path: str):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
+        print("[INFO] 드라이브 업로드 건너뜀(시크릿 없음)")
         return
     try:
-        r = requests.post(url, json={"text": text}, timeout=25)
-        if r.status_code >= 300:
-            print("[Slack 실패]", r.status_code, r.text[:300])
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+
+        creds = Credentials(
+            None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            token_uri="https://oauth2.googleapis.com/token",
+        )
+        service = build("drive", "v3", credentials=creds)
+        file_metadata = {"name": os.path.basename(local_path), "parents": [GDRIVE_FOLDER_ID]}
+        media = MediaFileUpload(local_path, resumable=True)
+        service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        print("[INFO] 드라이브 업로드 OK:", os.path.basename(local_path))
     except Exception as e:
-        print("[Slack 예외]", e)
+        print("[경고] 드라이브 업로드 실패:", e)
 
-def fmt_jpy(v):
-    try: return f"￥{int(v):,}"
-    except: return "￥0"
-
-# ================= Google Drive =================
-def normalize_folder_id(raw: str) -> str:
-    if not raw: return ""
-    s = raw.strip()
-    m = re.search(r"/folders/([a-zA-Z0-9_-]{10,})", s) or re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", s)
-    return (m.group(1) if m else s)
-
-def build_drive_service():
-    from googleapiclient.discovery import build
-    from google.oauth2.credentials import Credentials
-    cid = os.getenv("GOOGLE_CLIENT_ID")
-    csec = os.getenv("GOOGLE_CLIENT_SECRET")
-    rtk = os.getenv("GOOGLE_REFRESH_TOKEN")
-    if not (cid and csec and rtk):
-        raise RuntimeError("Google Drive OAuth 시크릿 누락")
-    creds = Credentials(None, refresh_token=rtk, token_uri="https://oauth2.googleapis.com/token",
-                        client_id=cid, client_secret=csec)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-def drive_upload_csv(service, folder_id: str, name: str, df: pd.DataFrame) -> str:
-    from googleapiclient.http import MediaIoBaseUpload
-    q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
-    res = service.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    file_id = res.get("files", [{}])[0].get("id") if res.get("files") else None
-    buf = io.BytesIO(); df.to_csv(buf, index=False, encoding="utf-8-sig"); buf.seek(0)
-    media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=False)
-    if file_id:
-        service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute(); return file_id
-    meta = {"name": name, "parents": [folder_id], "mimeType": "text/csv"}
-    created = service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
-    return created["id"]
-
-def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFrame]:
-    from googleapiclient.http import MediaIoBaseDownload
-    res = service.files().list(q=f"name = '{name}' and '{folder_id}' in parents and trashed = false",
-                               fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    fs = res.get("files", [])
-    if not fs: return None
-    fid = fs[0]["id"]
-    req = service.files().get_media(fileId=fid, supportsAllDrives=True)
-    fh = io.BytesIO(); dl = MediaIoBaseDownload(fh, req); done = False
-    while not done: _, done = dl.next_chunk()
-    fh.seek(0); return pd.read_csv(fh)
-
-# ================= ScraperAPI 호출 & 파싱 =================
-SCRAPER_ENDPOINT = "https://api.scraperapi.com/"
-SCRAPER_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
-YEN_RE = re.compile(r"([0-9,]+)\s*円")
-
-def scraperapi_get(url: str, render: bool) -> str:
-    if not SCRAPER_KEY:
-        raise RuntimeError("SCRAPERAPI_KEY 미설정")
-    params = {
-        "api_key": SCRAPER_KEY,
-        "url": url,
-        "country_code": "jp",
-        "retry_404": "true",
-        "render": "true" if render else "false",
-    }
-    r = requests.get(SCRAPER_ENDPOINT, params=params, timeout=60)
-    r.raise_for_status()
-    return r.text
-
-def select_cards(soup: BeautifulSoup) -> List:
-    cards = soup.select("li.rnkRanking_item")
-    if not cards:
-        cards = soup.select("ul.rnkRanking_list > li")
-    return cards
-
-def parse_rank_page(html: str, add_offset: int) -> List[Dict]:
-    soup = BeautifulSoup(html, "lxml")
-    els = select_cards(soup)
-    rows: List[Dict] = []
-    for i, li in enumerate(els, start=1):
-        # rank
-        rk_el = li.select_one(".rnkRanking_rank")
-        rk_txt = clean(rk_el.get_text()) if rk_el else ""
-        try: rank = int(re.sub(r"\D", "", rk_txt)) if rk_txt else i + add_offset
-        except: rank = i + add_offset
-        # name/url
-        a = li.select_one(".rnkRanking_itemName a") or li.select_one("a[href*='item.rakuten.co.jp']")
-        name = clean(a.get_text()) if a else ""
-        href = a.get("href").strip() if a and a.has_attr("href") else ""
-        href = re.sub(r"[?#].*$", "", href)
-        # shop
-        sh = li.select_one(".rnkRanking_itemShop a")
-        shop = clean(sh.get_text()) if sh else ""
-        # price
-        pr_el = li.select_one(".rnkRanking_itemPrice") or li.select_one(".important")
-        pr_txt = clean(pr_el.get_text()) if pr_el else ""
-        m = YEN_RE.search(pr_txt)
-        price = int(m.group(1).replace(",", "")) if m else None
-        rows.append({"rank": rank, "brand": shop, "product_name": name, "price": price, "url": href})
-    return rows
-
-def fetch_all() -> List[Dict]:
-    os.makedirs("data/debug", exist_ok=True)
-    allrows: List[Dict] = []
-    for url in RANK_URLS:
-        add = 80 if "p=2" in url else 0
-        render_first = True if FORCE_RENDER else False
-        html = scraperapi_get(url, render=render_first)
-        if SAVE_DEBUG:
-            open(f"data/debug/rakuten_{'p2' if add else 'p1'}_raw.html","w",encoding="utf-8").write(html)
-        rows = parse_rank_page(html, add)
-        if len(rows) == 0 and not render_first:
-            # 빈 경우에만 한 번 렌더로 재시도(크레딧 절약)
-            html = scraperapi_get(url, render=True)
-            if SAVE_DEBUG:
-                open(f"data/debug/rakuten_{'p2' if add else 'p1'}_render.html","w",encoding="utf-8").write(html)
-            rows = parse_rank_page(html, add)
-        allrows.extend(rows)
-        time.sleep(0.8)
-    allrows = sorted(allrows, key=lambda r: r["rank"])[:MAX_RANK]
-    return allrows
-
-# ================= Slack 섹션 구성 =================
-def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
-    S = {"top10": [], "falling": [], "inout_count": 0}
-    if "rank" not in df_today.columns or len(df_today) == 0:
-        return S
-
-    def _name(r):
-        nm = clean(r.get("product_name", ""))
-        br = clean(r.get("brand", ""))
-        return f"{br} {nm}" if br and br and not nm.lower().startswith(br.lower()) else nm
-
-    def _link(r):
-        return f"<{r['url']}|{slack_escape(_name(r))}>" if r.get("url") else slack_escape(_name(r))
-
-    prev_idx = None
-    if df_prev is not None and len(df_prev) and "rank" in df_prev.columns:
-        prev_idx = df_prev.copy()
-        prev_idx["__k__"] = prev_idx["url"].astype(str).str.strip()
-        prev_idx.set_index("__k__", inplace=True)
-
-    # TOP10
-    top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
-    lines = []
-    for _, r in top10.iterrows():
-        mark = ""
-        if prev_idx is not None:
-            k = str(r.get("url")).strip()
-            if k in prev_idx.index and pd.notnull(prev_idx.loc[k, "rank"]):
-                pr = int(prev_idx.loc[k, "rank"]); cr = int(r["rank"])
-                diff = pr - cr
-                if diff > 0: mark = f"(↑{diff}) "
-                elif diff < 0: mark = f"(↓{abs(diff)}) "
-                else: mark = "(-) "
-            else:
-                mark = "(New) "
-        price_txt = fmt_jpy(r.get("price")) if pd.notnull(r.get("price")) else "￥0"
-        lines.append(f"{int(r['rank'])}. {mark}{_link(r)} — {price_txt}")
-    S["top10"] = lines
-
-    if prev_idx is None:
-        return S
-
-    # 급하락 & 인/아웃
-    cur_idx = df_today.copy()
-    cur_idx["__k__"] = cur_idx["url"].astype(str).str.strip()
-    cur_idx.set_index("__k__", inplace=True)
-
-    tN = cur_idx[(cur_idx["rank"].notna()) & (cur_idx["rank"] <= MAX_RANK)]
-    pN = prev_idx[(prev_idx["rank"].notna()) & (prev_idx["rank"] <= MAX_RANK)]
-
-    common = set(tN.index) & set(pN.index)
-    out_only = set(pN.index) - set(tN.index)
-
-    movers = []
-    for k in common:
-        pr, cr = int(pN.loc[k, "rank"]), int(tN.loc[k, "rank"])
-        drop = cr - pr
-        if drop > 0:
-            row = tN.loc[k]
-            movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})"))
-    movers.sort(key=lambda x: (-x[0], x[1], x[2]))
-    falling = [m[3] for m in movers[:5]]
-
-    if len(falling) < 5:
-        outs = sorted(list(out_only), key=lambda k: int(pN.loc[k, "rank"]))
-        for k in outs:
-            if len(falling) >= 5: break
-            row = pN.loc[k]
-            falling.append(f"- {_link(row)} {int(row['rank'])}위 → OUT")
-    S["falling"] = falling
-
-    today_keys, prev_keys = set(tN.index), set(pN.index)
-    S["inout_count"] = len(today_keys ^ prev_keys) // 2
-    return S
-
-def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
-    lines = []
-    lines.append(f"*Rakuten Japan 뷰티 랭킹 {MAX_RANK} — {date_str}*")
-    lines.append("")
-    if S["top10"]:
-        lines.append("*TOP 10*"); lines.extend(S["top10"])
-        lines.append(""); lines.append("*📉 급하락*"); lines.extend(S.get("falling") or ["- 해당 없음"])
-        lines.append(""); lines.append("*↔ 랭크 인&아웃*")
-        lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
-    else:
-        lines.append("_수집된 랭킹이 없습니다. 디버그 HTML 확인 또는 렌더 강제 실행을 사용하세요._")
-    return "\n".join(lines)
-
-# ================= 메인 =================
+# -----------------------
+# 메인
+# -----------------------
 def main():
-    print("[INFO] 라쿠텐 랭킹 수집 시작(ScraperAPI, 절약모드)")
-    rows = fetch_all()
-    print("[INFO] 수집:", len(rows))
+    print("[INFO] 라쿠텐 뷰티 랭킹 수집 시작")
+    all_rows = []
+    for i, url in enumerate(PAGE_URLS, start=1):
+        rows = fetch_one(url, prefix=f"rakuten_p{i}")
+        all_rows.extend(rows)
 
-    date_str = today()
-    os.makedirs("data", exist_ok=True)
-    df_today = pd.DataFrame(rows)
-    df_today.insert(0, "date", date_str)
-    file_today = build_filename(date_str)
-    df_today.to_csv(os.path.join("data", file_today), index=False, encoding="utf-8-sig")
-    print("[INFO] 로컬 CSV 저장:", file_today)
+    # 정리/필터
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["name"]).reset_index(drop=True)
+    df = df[(df["rank"] >= 1) & (df["rank"] <= MAX_RANK)]
+    df = df.sort_values("rank").reset_index(drop=True)
 
-    # Drive 업로드 + 전일 로드
-    df_prev = None
-    folder = normalize_folder_id(os.getenv("GDRIVE_FOLDER_ID", ""))
-    if folder:
-        try:
-            svc = build_drive_service()
-            drive_upload_csv(svc, folder, file_today, df_today)
-            y_name = build_filename(yesterday())
-            df_prev = drive_download_csv(svc, folder, y_name)
-            print("[INFO] 드라이브 업로드 OK, 전일:", "있음" if df_prev is not None else "없음")
-        except Exception as e:
-            print("[Drive 오류]", e); traceback.print_exc()
-    else:
-        print("[INFO] GDRIVE_FOLDER_ID 미설정 → 업로드 생략")
+    print(f"[INFO] 수집 개수: {len(df)}")
 
-    if len(df_today) == 0 or "rank" not in df_today.columns:
-        slack_post("*라쿠텐 랭킹 수집 경고* : 수집 0개\n- ScraperAPI 크레딧/차단/렌더 여부 확인\n- data/debug 내 raw.html 확인\n- 필요 시 env `RAKUTEN_FORCE_RENDER=1`")
-        return
+    # CSV 저장
+    csv_path = os.path.join(DATA_DIR, f"라쿠텐재팬_뷰티_랭킹_{YMD}.csv")
+    df_out = df[["rank","name","price","url"]].copy()
+    df_out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print("[INFO] 로컬 CSV 저장:", os.path.basename(csv_path))
 
-    S = build_sections(df_today, df_prev)
-    slack_post(build_slack_message(date_str, S))
-    print("[INFO] Slack 전송 완료")
+    # 전일 비교
+    df_prev = load_prev_csv(csv_path)
+    m, top10, inout_cnt = build_sections(df_out, df_prev)
+
+    # 슬랙 메시지
+    title = f"📊 일간 리포트 · 라쿠텐JP 뷰티 Top160 ({YMD})"
+    lines = [f"*{title}*"]
+    # Top10
+    lines.append("\n*🏆 Top10 (일간, raw 제품명)*")
+    for r, dtxt, name in top10:
+        lines.append(f"{r:>3}위 | {dtxt} | {name}")
+
+    # 인&아웃
+    lines.append("\n*↔ 랭크 인&아웃*")
+    lines.append(f"{inout_cnt}개의 제품이 인&아웃 되었습니다.")
+
+    slack_post(lines)
+
+    # 드라이브 업로드(옵션)
+    upload_gdrive(csv_path)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("[오류]", e); traceback.print_exc()
-        try: slack_post(f"*라쿠텐 랭킹 실패*\n```\n{e}\n```")
-        except: pass
+        print("[오류 발생]", e)
         raise
