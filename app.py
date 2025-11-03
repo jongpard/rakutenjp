@@ -2,9 +2,11 @@
 """
 Rakuten JP · Beauty(100939) Daily Ranking Top160
 - ScraperAPI (JP, render=true) with throttle detection, session rotation, exponential backoff
-- Fallback to Playwright (headless Chromium) to force-load 80 items per page
-- Saves CSV to data/, debug HTML to data/debug/
-- Posts Slack Top10 (delta shown as '-') and uploads CSV to Google Drive (if secrets set)
+- Fallback to Playwright to force-load 80 items/page
+- Robust parser including TOP3 boxes (1~3위) + normal list (4위~)
+- Brand normalization: aggregator shops (e.g., 楽天24) are NOT brands
+- Slack Top10 (raw + (ko) optional), I/O section fixed text
+- Google Drive upload
 """
 
 import os, re, sys, time, random, traceback, datetime as dt
@@ -33,7 +35,13 @@ MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
 # Secrets & Options
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+SLACK_TRANSLATE_JA2KO = os.getenv("SLACK_TRANSLATE_JA2KO", "1") == "1"
 
+# Naver Papago (선택)
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "qA98WCnxWFvx_odn1fKc")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "G_kRiRAk7z")
+
+# Google Drive
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
@@ -72,11 +80,26 @@ def clean_price(txt: str):
     m = re.search(r"[\d,]+", txt)
     return int(m.group().replace(",", "")) if m else None
 
+# ========= Translation (Papago) =========
+from functools import lru_cache
+@lru_cache(maxsize=4096)
+def translate_ja_ko(text: str) -> str:
+    if not SLACK_TRANSLATE_JA2KO or not text:
+        return ""
+    try:
+        url = "https://openapi.naver.com/v1/papago/n2mt"
+        headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+        data = {"source": "ja", "target": "ko", "text": text[:4900]}
+        r = requests.post(url, headers=headers, data=data, timeout=5)
+        r.raise_for_status()
+        return r.json()["message"]["result"]["translatedText"]
+    except Exception:
+        return ""
+
 # ========= ScraperAPI (render) with throttle handling =========
-def scraper_get(url: str, dbg_name: str, max_retry: int = 6, base_wait: float = 1.2) -> str:
+def scraper_get(url: str, dbg_name: str, max_retry: int = 6) -> str:
     if not SCRAPERAPI_KEY:
         raise RuntimeError("SCRAPERAPI_KEY 미설정")
-
     last_err = None
     for attempt in range(1, max_retry + 1):
         session_id = f"rk-{int(time.time()*1000)}-{random.randint(1000,9999)}"
@@ -89,19 +112,16 @@ def scraper_get(url: str, dbg_name: str, max_retry: int = 6, base_wait: float = 
             "keep_headers": "true",
             "device_type": "desktop",
             "session_number": session_id,
-            "wait_for": "div.rnkRanking_after4box",
-            "wait_time": "5000",  # ms
+            "wait_for": "div.rnkRanking_after4box,div.rnkRanking_top3box",
+            "wait_time": "5000",
         }
         try:
             r = requests.get("https://api.scraperapi.com/", params=params, headers=HEADERS, timeout=60)
             r.raise_for_status()
             html = r.text
-            # save debug
             open(os.path.join(DBG_DIR, f"{dbg_name}_try{attempt}.html"), "w", encoding="utf-8").write(html or "")
-
             if not is_throttled(html) and len(html) > 2000:
                 return html
-
             wait = min(2 ** attempt, 20) + random.uniform(0.3, 0.9)
             log(f"[WARN] throttled (try {attempt}/{max_retry}, session={session_id}) → sleep {wait:.1f}s")
             time.sleep(wait)
@@ -110,7 +130,6 @@ def scraper_get(url: str, dbg_name: str, max_retry: int = 6, base_wait: float = 
             wait = min(2 ** attempt, 20) + random.uniform(0.3, 0.9)
             log(f"[WARN] ScraperAPI 예외 (try {attempt}/{max_retry}): {e} → sleep {wait:.1f}s")
             time.sleep(wait)
-
     if last_err:
         raise last_err
     raise RuntimeError("ScraperAPI throttled")
@@ -130,8 +149,6 @@ def render_with_playwright(url: str, max_wait_ms: int = 18000) -> str:
         page = context.new_page()
         page.set_default_timeout(20000)
         page.goto(url, wait_until="domcontentloaded")
-
-        # scroll to load
         start = time.time()
         last_h = 0
         while time.time() - start < max_wait_ms / 1000.0:
@@ -147,69 +164,117 @@ def render_with_playwright(url: str, max_wait_ms: int = 18000) -> str:
         browser.close()
     return html
 
+# ========= Brand normalize =========
+AGGREGATOR_SHOPS = {
+    "楽天24", "Rakuten24", "Rakuten 24", "ケンコーコム", "爽快ドラッグ", "LOHACO",
+}
+STOPWORDS = [
+    "楽天市場店","公式","オフィシャル","ショップ","ストア","専門店","直営",
+    "店","本店","支店","楽天市場","楽天","mall","MALL","shop","SHOP","store","STORE",
+]
+def _clean_brand(b: str) -> str:
+    if not b: return ""
+    b = re.sub(r"[【】\[\]（）()]", "", b)
+    for w in STOPWORDS:
+        b = re.sub(w, "", b, flags=re.IGNORECASE)
+    b = re.sub(r"\s{2,}", " ", b).strip(" -_·|·")
+    b = re.sub(r"\d+$", "", b).strip()
+    if not b or re.fullmatch(r"\d+", b) or len(b) < 2:
+        return ""
+    return b
+def _brand_from_name(name: str) -> str:
+    if not name: return ""
+    m = re.search(r"【\s*公式\s*】\s*([^\s\|｜/／]+)", name)
+    if m: return _clean_brand(m.group(1))
+    m = re.search(r"【\s*([^\s\|｜/／]+)\s*】", name)
+    if m: return _clean_brand(m.group(1))
+    tok = re.split(r"[｜\|/／\s]+", name.strip())[0]
+    return _clean_brand(tok)
+def extract_brand(name: str, shop: str) -> str:
+    shop = (shop or "").strip()
+    if any(a in shop for a in AGGREGATOR_SHOPS):
+        return _brand_from_name(name) or ""
+    b = re.split(r"(?:公式|オフィシャル|ショップ|ストア|直営|楽天市場店)", shop)[0].strip()
+    b = _clean_brand(b)
+    if b: return b
+    return _brand_from_name(name)
+
 # ========= Parsing =========
+# TOP3 전용 + 일반 리스트 모두 커버
+TOP3_SEL = ",".join([
+    "#rnkRankingTop3 .rnkRanking_top3box",
+    "div.rnkRanking_top3box",
+])
 CARD_SEL = ",".join([
     "div.rnkRanking_after4box",
     "div.rnkRanking_box",
     "li.rnkRanking_item",
     "li.rnkRankingList__item",
 ])
-RANK_SELS  = [".rnkRanking_rank", ".rnkRanking_dispRank", "[class*='Rank']", "[class*='rank']"]
-NAME_SELS  = [".rnkRanking_itemName a", "a.rnkRanking_itemName", ".itemName a", "a[href*='item.rakuten.co.jp']", "a"]
-PRICE_SELS = [".rnkRanking_price", ".price", "[class*='price']"]
-SHOP_SELS  = [".rnkRanking_shop a", ".rnkRanking_shop", "[class*='shop'] a"]
-
-STOPWORDS = ["楽天市場店","公式","オフィシャル","ショップ","ストア","専門店","直営","店","本店","支店",
-             "楽天市場","楽天","mall","MALL","shop","SHOP","store","STORE"]
-
-def brand_from_shop(shop: str) -> str:
-    if not shop:
-        return ""
-    b = shop
-    for w in STOPWORDS:
-        b = re.sub(w, "", b, flags=re.IGNORECASE)
-    b = re.sub(r"[【】\[\]（）()]", "", b)
-    b = re.sub(r"\s{2,}", " ", b).strip(" -_·|·")
-    return b.strip()
 
 def pick_one(el, sels):
     for s in sels:
         f = el.select_one(s)
-        if f:
-            return f
+        if f: return f
     return None
+
+def find_rank_text(scope):
+    # rank 텍스트를 다양한 위치에서 탐색 (예: "1位", "3 位")
+    cand = scope.select("[class*='Rank'], .rnkRanking_dispRank, .rnkRanking_rank, [id*='Rank']")
+    for c in cand:
+        t = c.get_text(" ", strip=True)
+        m = re.search(r"(\d+)\s*位", t)
+        if m:
+            return int(m.group(1))
+    # 최후의 보루: scope 내 전체 텍스트에서 패턴 찾기
+    t = scope.get_text(" ", strip=True)
+    m = re.search(r"(\d+)\s*位", t)
+    return int(m.group(1)) if m else None
+
+def parse_cards(scope):
+    items = []
+    # 이름/URL
+    a = scope.select_one(".rnkRanking_itemName a") or scope.select_one("a.rnkRanking_itemName")
+    if not a:
+        # 이미지 링크가 메인 링크인 경우
+        a = scope.select_one(".rnkRanking_image a") or scope.select_one("a[href*='item.rakuten.co.jp']")
+    name = a.get_text(strip=True) if a else ""
+    url = a.get("href") if a and a.has_attr("href") else ""
+    if url and url.startswith("//"): url = "https:" + url
+    if url and url.startswith("/"):  url = urljoin("https://ranking.rakuten.co.jp", url)
+
+    # 가격/샵
+    price_el = scope.select_one(".rnkRanking_price") or scope.select_one(".price")
+    shop_el  = scope.select_one(".rnkRanking_shop a") or scope.select_one(".rnkRanking_shop")
+    price = clean_price(price_el.get_text(strip=True)) if price_el else None
+    shop  = shop_el.get_text(strip=True) if shop_el else ""
+
+    # 랭크
+    rank = find_rank_text(scope)
+    if rank and name:
+        items.append({"rank":rank,"name":name,"price":price,"shop":shop,"url":url})
+    return items
 
 def parse_page(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     rows = []
+
+    # 1) TOP3 먼저
+    for box in soup.select(TOP3_SEL):
+        rows.extend(parse_cards(box))
+
+    # 2) 일반 리스트
     for card in soup.select(CARD_SEL):
-        rk_el = pick_one(card, RANK_SELS)
-        if not rk_el:
-            continue
-        rank = only_digits(rk_el.get_text(strip=True))
-        if not rank:
-            continue
+        rows.extend(parse_cards(card))
 
-        a = pick_one(card, NAME_SELS)
-        name = a.get_text(strip=True) if a else ""
-        href = a.get("href") if a and a.has_attr("href") else ""
-        if href and href.startswith("/"):
-            href = urljoin("https://ranking.rakuten.co.jp", href)
-        if href and href.startswith("//"):
-            href = "https:" + href
-
-        pr_el = pick_one(card, PRICE_SELS)
-        price = clean_price(pr_el.get_text(strip=True)) if pr_el else None
-
-        sh = pick_one(card, SHOP_SELS)
-        shop = sh.get_text(strip=True) if sh else ""
-        brand = brand_from_shop(shop)
-
-        if name:
-            rows.append({
-                "rank": rank, "name": name, "price": price,
-                "shop": shop, "brand": brand, "url": href
-            })
+    # 3) 중복 제거 + 정렬
+    # URL을 키로 1차, rank로 2차 보정
+    tmp = {}
+    for it in rows:
+        key = (it["url"] or "") + f"#{it['rank']}"
+        tmp[key] = it
+    rows = list(tmp.values())
+    rows.sort(key=lambda x: x["rank"])
     return rows
 
 # ========= Slack =========
@@ -218,7 +283,11 @@ def build_slack(df: pd.DataFrame) -> str:
              "", "*🏆 Top10 (raw 제품명)*"]
     for _, r in df.sort_values("rank").head(10).iterrows():
         price = f" — ¥{int(r['price']):,}" if pd.notna(r.get("price")) else ""
-        lines.append(f"{int(r['rank']):>3}위 | - | {r['name']}{price}")
+        raw = r["name"]
+        ko  = translate_ja_ko(raw)
+        link = f"<{r['url']}|{raw}>"
+        ko_part = f" ({ko})" if ko else ""
+        lines.append(f"{int(r['rank']):>3}위 | {link}{ko_part}{price}")
     lines += ["", "*↔ 랭크 인&아웃*", "0개의 제품이 인&아웃 되었습니다."]
     return "\n".join(lines)
 
@@ -242,7 +311,6 @@ def upload_gdrive(local_path: str):
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
-
         creds = Credentials(
             None,
             refresh_token=GOOGLE_REFRESH_TOKEN,
@@ -265,8 +333,7 @@ def collect() -> pd.DataFrame:
     for i, url in enumerate(PAGE_URLS, start=1):
         log(f"[GET] {url}")
         ok = False
-
-        # 1) ScraperAPI(렌더) 우선
+        # 1) ScraperAPI(렌더)
         try:
             html = scraper_get(url, dbg_name=f"p{i}")
             if is_throttled(html):
@@ -274,11 +341,11 @@ def collect() -> pd.DataFrame:
             rows = parse_page(html)
             log(f"[parse] p{i}: {len(rows)}")
             all_rows.extend(rows)
-            ok = len(rows) >= 60  # 60 이상이면 충분
+            ok = len(rows) >= 60
         except Exception as e:
             log(f"[WARN] ScraperAPI 실패: {e}")
 
-        # 2) 부족하면 Playwright 폴백 한 번
+        # 2) 부족하면 Playwright 폴백
         if not ok:
             try:
                 pw_html = render_with_playwright(url, max_wait_ms=18000)
@@ -291,17 +358,18 @@ def collect() -> pd.DataFrame:
             except Exception as e:
                 log(f"[ERROR] Playwright 폴백 실패: {e}")
 
-        # 페이지 간 휴식(차단 완화)
-        time.sleep(1.2)
+        time.sleep(1.0)  # 페이지 간 딜레이
 
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        log("[ERROR] 수집 0건 — 전량 차단됨. data/debug/* 열어 확인")
+    if not all_rows:
+        log("[ERROR] 수집 0건 — 전량 차단됨. data/debug/* 확인")
         sys.exit(1)
 
-    # 중복·정렬·Cut
-    df = df.drop_duplicates(subset=["rank"]).sort_values("rank")
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["rank"]).sort_values("rank")
     df = df[df["rank"] <= MAX_RANK].reset_index(drop=True)
+
+    # 브랜드 최종 정리
+    df["brand"] = df.apply(lambda r: extract_brand(r["name"], r["shop"]), axis=1)
+
     log(f"[INFO] 수집 개수: {len(df)}")
     return df
 
@@ -309,15 +377,11 @@ def main():
     log("[INFO] 라쿠텐 뷰티 랭킹 수집 시작")
     df = collect()
 
-    # CSV 저장
     csv_path = os.path.join(DATA_DIR, f"라쿠텐재팬_뷰티_랭킹_{TODAY}.csv")
     df[["rank","name","price","shop","brand","url"]].to_csv(csv_path, index=False, encoding="utf-8-sig")
     log(f"[INFO] CSV 저장: {csv_path}")
 
-    # Slack
     slack_post(build_slack(df))
-
-    # Google Drive
     upload_gdrive(csv_path)
 
 if __name__ == "__main__":
