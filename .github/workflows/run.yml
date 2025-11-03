@@ -2,7 +2,7 @@ name: rakutenjp-beauty-rank
 
 on:
   schedule:
-    - cron: "11 4 * * *"   # 매일 KST 13:11 (UTC 04:11)
+    - cron: "11 4 * * *"     # 매일 KST 13:11 (UTC 04:11)
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
@@ -20,9 +20,8 @@ jobs:
       RAKUTEN_MAX_RANK: "160"
 
       # Secrets
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SCRAPERAPI_KEY:    ${{ secrets.SCRAPERAPI_KEY }}
-
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
