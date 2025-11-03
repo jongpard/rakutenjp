@@ -123,6 +123,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    except Exception as e:
-        print("[오류 발생]", e)
-        raise
