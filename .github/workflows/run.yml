@@ -2,7 +2,7 @@ name: rakutenjp-beauty-rank
 
 on:
   schedule:
-    - cron: "11 4 * * *" # 매일 KST 11:11 (UTC 04:11)
+    - cron: "11 2 * * *"   # 매일 KST 11:11 == UTC 02:11
   workflow_dispatch:
 
 concurrency:
@@ -18,16 +18,19 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      # 동작 옵션
-      RAKUTEN_MAX_RANK: "160"         # 1~160위까지
-      SLACK_TRANSLATE_JA2KO: "1"      # 일본어 1줄 번역 (끄려면 0)
+      # ===== 앱 동작 옵션 =====
+      RAKUTEN_MAX_RANK: "160"
+      SLACK_TRANSLATE_JA2KO: "1"
 
-      # 시크릿(필수)
+      # ===== 시크릿(필수) =====
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+      # 🔴 여기 필수! (지금 에러 원인)
+      SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
 
     steps:
       - name: Checkout
@@ -42,40 +45,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install playwright==1.46.0
-          pip install beautifulsoup4 lxml requests pandas
+          pip install beautifulsoup4 lxml requests pandas pytz
           pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
-          # ✅ Google Drive 업로드에 필수
           pip install -U packaging
-          # 번역 백엔드 2종
           pip install googletrans==4.0.0rc1 deep-translator
 
-      - name: Install Playwright browsers
-        run: |
-          python -m playwright install --with-deps chromium
-
-      # ✅ 드라이브/슬랙 시크릿이 제대로 들어왔는지 빠르게 확인
       - name: Preflight check (secrets & imports)
         run: |
           python - << 'PY'
-          import os, importlib, sys
-          keys = [
-              "GDRIVE_FOLDER_ID",
-              "GOOGLE_CLIENT_ID",
-              "GOOGLE_CLIENT_SECRET",
-              "GOOGLE_REFRESH_TOKEN",
-              "SLACK_WEBHOOK_URL",
-          ]
+          import os, importlib
+          keys = ["SCRAPERAPI_KEY","SLACK_WEBHOOK_URL","GDRIVE_FOLDER_ID",
+                  "GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","GOOGLE_REFRESH_TOKEN"]
           print("== Secret presence ==")
           for k in keys:
               v = os.getenv(k)
               print(f"{k:20}:", "SET" if v else "MISSING", "| len =", (len(v) if v else 0))
-          print("\n== Python deps check ==")
-          for m in ["googleapiclient.discovery","google.api_core","packaging.version"]:
+          print("\n== Python deps ==")
+          for m in ["googleapiclient.discovery","google.api_core","packaging.version","bs4","lxml","requests","pandas"]:
               try:
-                  importlib.import_module(m)
-                  print(m, "OK")
+                  importlib.import_module(m); print(m, "OK")
               except Exception as e:
-                  print(m, "FAIL:", e); sys.exit(1)
+                  print(m, "FAIL:", e); raise
           PY
 
       - name: Run rakuten app.py
