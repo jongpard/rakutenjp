@@ -1,41 +1,35 @@
 # -*- coding: utf-8 -*-
 import os, re, io, time, traceback, datetime as dt
-from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Dict, Optional
 
 import requests
 import pandas as pd
+from bs4 import BeautifulSoup
 import pytz
 
-# ====== 기본 설정 ======
+# ================= 기본 설정 =================
 KST = pytz.timezone("Asia/Seoul")
-MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
-
-RANK_URLS = [
-    "https://ranking.rakuten.co.jp/daily/100939/",       # 1~80
-    "https://ranking.rakuten.co.jp/daily/100939/p=2/",    # 81~160
-]
-
-SCRAPER_ENDPOINT = "https://api.scraperapi.com/"
-SCRAPER_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
-
-# ====== 공통 유틸 ======
 def now_kst(): return dt.datetime.now(KST)
 def today(): return now_kst().strftime("%Y-%m-%d")
 def yesterday(): return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 def build_filename(d): return f"라쿠텐재팬_뷰티_랭킹_{d}.csv"
+def clean(s: str) -> str: return re.sub(r"\s+", " ", (s or "")).strip()
+def slack_escape(s: str) -> str: return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
+FORCE_RENDER = os.getenv("RAKUTEN_FORCE_RENDER", "0") in ("1","true","True")
+SAVE_DEBUG = os.getenv("RAKUTEN_SAVE_DEBUG", "1") in ("1","true","True")
 
-def slack_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+RANK_URLS = [
+    "https://ranking.rakuten.co.jp/daily/100939/",
+    "https://ranking.rakuten.co.jp/daily/100939/p=2/",
+]
 
-# ====== Slack ======
+# ================= Slack =================
 def slack_post(text: str):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
-        print("[Slack 미설정] 메시지:\n", text)
+        print("[Slack 미설정]", text[:2000])
         return
     try:
         r = requests.post(url, json={"text": text}, timeout=25)
@@ -44,7 +38,11 @@ def slack_post(text: str):
     except Exception as e:
         print("[Slack 예외]", e)
 
-# ====== Google Drive ======
+def fmt_jpy(v):
+    try: return f"￥{int(v):,}"
+    except: return "￥0"
+
+# ================= Google Drive =================
 def normalize_folder_id(raw: str) -> str:
     if not raw: return ""
     s = raw.strip()
@@ -54,7 +52,9 @@ def normalize_folder_id(raw: str) -> str:
 def build_drive_service():
     from googleapiclient.discovery import build
     from google.oauth2.credentials import Credentials
-    cid, csec, rtk = (os.getenv("GOOGLE_CLIENT_ID"), os.getenv("GOOGLE_CLIENT_SECRET"), os.getenv("GOOGLE_REFRESH_TOKEN"))
+    cid = os.getenv("GOOGLE_CLIENT_ID")
+    csec = os.getenv("GOOGLE_CLIENT_SECRET")
+    rtk = os.getenv("GOOGLE_REFRESH_TOKEN")
     if not (cid and csec and rtk):
         raise RuntimeError("Google Drive OAuth 시크릿 누락")
     creds = Credentials(None, refresh_token=rtk, token_uri="https://oauth2.googleapis.com/token",
@@ -66,7 +66,6 @@ def drive_upload_csv(service, folder_id: str, name: str, df: pd.DataFrame) -> st
     q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
     res = service.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     file_id = res.get("files", [{}])[0].get("id") if res.get("files") else None
-
     buf = io.BytesIO(); df.to_csv(buf, index=False, encoding="utf-8-sig"); buf.seek(0)
     media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=False)
     if file_id:
@@ -79,16 +78,17 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     from googleapiclient.http import MediaIoBaseDownload
     res = service.files().list(q=f"name = '{name}' and '{folder_id}' in parents and trashed = false",
                                fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    files = res.get("files", [])
-    if not files: return None
-    fid = files[0]["id"]
+    fs = res.get("files", [])
+    if not fs: return None
+    fid = fs[0]["id"]
     req = service.files().get_media(fileId=fid, supportsAllDrives=True)
     fh = io.BytesIO(); dl = MediaIoBaseDownload(fh, req); done = False
     while not done: _, done = dl.next_chunk()
     fh.seek(0); return pd.read_csv(fh)
 
-# ====== ScraperAPI 호출 + 파싱 ======
-from bs4 import BeautifulSoup
+# ================= ScraperAPI 호출 & 파싱 =================
+SCRAPER_ENDPOINT = "https://api.scraperapi.com/"
+SCRAPER_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
 YEN_RE = re.compile(r"([0-9,]+)\s*円")
 
 def scraperapi_get(url: str, render: bool) -> str:
@@ -105,72 +105,75 @@ def scraperapi_get(url: str, render: bool) -> str:
     r.raise_for_status()
     return r.text
 
+def select_cards(soup: BeautifulSoup) -> List:
+    cards = soup.select("li.rnkRanking_item")
+    if not cards:
+        cards = soup.select("ul.rnkRanking_list > li")
+    return cards
+
 def parse_rank_page(html: str, add_offset: int) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.select("li.rnkRanking_item")
-    out = []
-    for i, li in enumerate(cards, start=1):
+    els = select_cards(soup)
+    rows: List[Dict] = []
+    for i, li in enumerate(els, start=1):
         # rank
         rk_el = li.select_one(".rnkRanking_rank")
         rk_txt = clean(rk_el.get_text()) if rk_el else ""
         try: rank = int(re.sub(r"\D", "", rk_txt)) if rk_txt else i + add_offset
         except: rank = i + add_offset
-
         # name/url
-        a = li.select_one(".rnkRanking_itemName a")
+        a = li.select_one(".rnkRanking_itemName a") or li.select_one("a[href*='item.rakuten.co.jp']")
         name = clean(a.get_text()) if a else ""
-        href = a.get("href") if a else ""
-        if href:
-            href = re.sub(r"[?#].*$", "", href.strip())
-
+        href = a.get("href").strip() if a and a.has_attr("href") else ""
+        href = re.sub(r"[?#].*$", "", href)
         # shop
-        shop = ""
         sh = li.select_one(".rnkRanking_itemShop a")
-        if sh: shop = clean(sh.get_text())
-
+        shop = clean(sh.get_text()) if sh else ""
         # price
-        raw_price = clean(li.select_one(".rnkRanking_itemPrice").get_text()) if li.select_one(".rnkRanking_itemPrice") else ""
-        m = YEN_RE.search(raw_price or "")
+        pr_el = li.select_one(".rnkRanking_itemPrice") or li.select_one(".important")
+        pr_txt = clean(pr_el.get_text()) if pr_el else ""
+        m = YEN_RE.search(pr_txt)
         price = int(m.group(1).replace(",", "")) if m else None
-
-        out.append({"rank": rank, "brand": shop, "product_name": name, "price": price, "url": href})
-    return out
+        rows.append({"rank": rank, "brand": shop, "product_name": name, "price": price, "url": href})
+    return rows
 
 def fetch_all() -> List[Dict]:
-    allrows = []
+    os.makedirs("data/debug", exist_ok=True)
+    allrows: List[Dict] = []
     for url in RANK_URLS:
         add = 80 if "p=2" in url else 0
-        # 1차: render=false (저렴)
-        html = scraperapi_get(url, render=False)
+        render_first = True if FORCE_RENDER else False
+        html = scraperapi_get(url, render=render_first)
+        if SAVE_DEBUG:
+            open(f"data/debug/rakuten_{'p2' if add else 'p1'}_raw.html","w",encoding="utf-8").write(html)
         rows = parse_rank_page(html, add)
-        if len(rows) == 0:
-            # 2차: render=true (해당 페이지만 재시도)
+        if len(rows) == 0 and not render_first:
+            # 빈 경우에만 한 번 렌더로 재시도(크레딧 절약)
             html = scraperapi_get(url, render=True)
+            if SAVE_DEBUG:
+                open(f"data/debug/rakuten_{'p2' if add else 'p1'}_render.html","w",encoding="utf-8").write(html)
             rows = parse_rank_page(html, add)
         allrows.extend(rows)
-        time.sleep(1.0)
-    # 상한/정렬
+        time.sleep(0.8)
     allrows = sorted(allrows, key=lambda r: r["rank"])[:MAX_RANK]
     return allrows
 
-# ====== Slack 메시지 구성 (변동 0은 '(-)' 고정) ======
-def fmt_jpy(v): 
-    try: return f"￥{int(v):,}"
-    except: return "￥0"
-
+# ================= Slack 섹션 구성 =================
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     S = {"top10": [], "falling": [], "inout_count": 0}
+    if "rank" not in df_today.columns or len(df_today) == 0:
+        return S
 
     def _name(r):
         nm = clean(r.get("product_name", ""))
         br = clean(r.get("brand", ""))
-        return f"{br} {nm}" if br and not nm.lower().startswith(br.lower()) else nm
+        return f"{br} {nm}" if br and br and not nm.lower().startswith(br.lower()) else nm
 
     def _link(r):
         return f"<{r['url']}|{slack_escape(_name(r))}>" if r.get("url") else slack_escape(_name(r))
 
     prev_idx = None
-    if df_prev is not None and len(df_prev):
+    if df_prev is not None and len(df_prev) and "rank" in df_prev.columns:
         prev_idx = df_prev.copy()
         prev_idx["__k__"] = prev_idx["url"].astype(str).str.strip()
         prev_idx.set_index("__k__", inplace=True)
@@ -197,6 +200,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     if prev_idx is None:
         return S
 
+    # 급하락 & 인/아웃
     cur_idx = df_today.copy()
     cur_idx["__k__"] = cur_idx["url"].astype(str).str.strip()
     cur_idx.set_index("__k__", inplace=True)
@@ -215,8 +219,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
             row = tN.loc[k]
             movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})"))
     movers.sort(key=lambda x: (-x[0], x[1], x[2]))
-
     falling = [m[3] for m in movers[:5]]
+
     if len(falling) < 5:
         outs = sorted(list(out_only), key=lambda k: int(pN.loc[k, "rank"]))
         for k in outs:
@@ -233,27 +237,25 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines = []
     lines.append(f"*Rakuten Japan 뷰티 랭킹 {MAX_RANK} — {date_str}*")
     lines.append("")
-    lines.append("*TOP 10*")
-    lines.extend(S.get("top10") or ["- 데이터 없음"])
-    lines.append("")
-    lines.append("*📉 급하락*")
-    lines.extend(S.get("falling") or ["- 해당 없음"])
-    lines.append("")
-    lines.append("*↔ 랭크 인&아웃*")
-    lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
+    if S["top10"]:
+        lines.append("*TOP 10*"); lines.extend(S["top10"])
+        lines.append(""); lines.append("*📉 급하락*"); lines.extend(S.get("falling") or ["- 해당 없음"])
+        lines.append(""); lines.append("*↔ 랭크 인&아웃*")
+        lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
+    else:
+        lines.append("_수집된 랭킹이 없습니다. 디버그 HTML 확인 또는 렌더 강제 실행을 사용하세요._")
     return "\n".join(lines)
 
-# ====== 메인 ======
+# ================= 메인 =================
 def main():
     print("[INFO] 라쿠텐 랭킹 수집 시작(ScraperAPI, 절약모드)")
     rows = fetch_all()
     print("[INFO] 수집:", len(rows))
 
     date_str = today()
+    os.makedirs("data", exist_ok=True)
     df_today = pd.DataFrame(rows)
     df_today.insert(0, "date", date_str)
-
-    os.makedirs("data", exist_ok=True)
     file_today = build_filename(date_str)
     df_today.to_csv(os.path.join("data", file_today), index=False, encoding="utf-8-sig")
     print("[INFO] 로컬 CSV 저장:", file_today)
@@ -269,10 +271,13 @@ def main():
             df_prev = drive_download_csv(svc, folder, y_name)
             print("[INFO] 드라이브 업로드 OK, 전일:", "있음" if df_prev is not None else "없음")
         except Exception as e:
-            print("[Drive 오류]", e)
-            traceback.print_exc()
+            print("[Drive 오류]", e); traceback.print_exc()
     else:
         print("[INFO] GDRIVE_FOLDER_ID 미설정 → 업로드 생략")
+
+    if len(df_today) == 0 or "rank" not in df_today.columns:
+        slack_post("*라쿠텐 랭킹 수집 경고* : 수집 0개\n- ScraperAPI 크레딧/차단/렌더 여부 확인\n- data/debug 내 raw.html 확인\n- 필요 시 env `RAKUTEN_FORCE_RENDER=1`")
+        return
 
     S = build_sections(df_today, df_prev)
     slack_post(build_slack_message(date_str, S))
@@ -282,9 +287,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("[오류]", e)
-        traceback.print_exc()
-        try:
-            slack_post(f"*라쿠텐 랭킹 실패*\n```\n{e}\n```")
+        print("[오류]", e); traceback.print_exc()
+        try: slack_post(f"*라쿠텐 랭킹 실패*\n```\n{e}\n```")
         except: pass
         raise
