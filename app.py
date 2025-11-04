@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten JP Beauty(100939) Daily Rank 1~160
-- ScraperAPI(JP, render=true)로 p=1,2만 수집 (절대 160 넘지 않음)
-- TOP3 + 이후 통합 파싱 (상품명 a 기준, 가까운 조상에서 랭크/가격/샵 추출)
-- rank_int/price_int 정규화 → 누락/정렬/비교 안정화
-- CSV 저장 + (옵션) Slack TOP10 (일본어+한국어 1줄)
+Rakuten JP Beauty(100939) Rank 1~160
+- 1차: ScraperAPI render=true
+- 2차: ScraperAPI render=false (보강)
+- 두 패스 병합 → 빈 랭크 보강(특히 TOP3/중간 누락)
+- 정규화(rank_int/price_int) 후 1~160 고정
+- CSV + Slack(TOP10 ja+ko)
 """
 
 import os, re, io, time, traceback, datetime as dt
@@ -14,21 +15,24 @@ import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
 
-# ---------------- 기본 설정 ----------------
+# ---------------- 공통/경로 ----------------
 KST = dt.timezone(dt.timedelta(hours=9))
 def kst_now(): return dt.datetime.now(KST)
 def today_str(): return kst_now().strftime("%Y-%m-%d")
 def clean(s): return re.sub(r"\s+", " ", (s or "")).strip()
 def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-DATA_DIR = "data"; os.makedirs(DATA_DIR, exist_ok=True)
+DATA_DIR = "data"
+DBG_DIR = os.path.join(DATA_DIR, "debug")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DBG_DIR, exist_ok=True)
 
-MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))  # ← 꼭 160 유지
+MAX_RANK = 160  # 고정
 SAVE_DEBUG = os.getenv("RAKUTEN_SAVE_DEBUG", "1") in ("1","true","True")
 DO_TRANSLATE = os.getenv("SLACK_TRANSLATE_JA2KO", "1") in ("1","true","True")
 
 BASE = "https://ranking.rakuten.co.jp/daily/100939/"
-PAGE_URLS = [BASE, BASE + "p=2/"]  # 1~80, 81~160만
+PAGE_URLS = [BASE, BASE + "p=2/"]  # 딱 1~160만
 
 FNAME = lambda d: f"라쿠텐재팬_뷰티_랭킹_{d}.csv"
 
@@ -42,14 +46,14 @@ HEADERS = {
     "Accept-Language": "ja,en-US;q=0.9,ko;q=0.8"
 }
 
-def scraper_get(url: str) -> str:
+def scraper_get(url: str, render: bool) -> str:
     if not SCRAPER_KEY:
         raise RuntimeError("SCRAPERAPI_KEY 미설정")
     params = {
         "api_key": SCRAPER_KEY,
         "url": url,
         "country_code": "jp",
-        "render": "true",
+        "render": "true" if render else "false",
         "retry_404": "true",
         "keep_headers": "true",
     }
@@ -58,8 +62,8 @@ def scraper_get(url: str) -> str:
     return r.text
 
 # ---------------- 파싱 ----------------
-YEN_RE = re.compile(r"([0-9,]+)\s*円")
-RANK_TXT_RE = re.compile(r"(\d+)\s*位")
+YEN_RE       = re.compile(r"([0-9,]+)\s*円")
+RANK_TXT_RE  = re.compile(r"(\d+)\s*位")
 BRAND_STOPWORDS = [
     "楽天市場店","公式","オフィシャル","ショップ","ストア","専門店","直営",
     "店","本店","支店","楽天市場","楽天","mall","MALL","shop","SHOP","store","STORE"
@@ -108,7 +112,7 @@ def parse_page(html: str) -> List[Dict]:
         if not block: continue
 
         rank = find_rank_in_block(block)
-        if not rank or rank in seen_ranks: 
+        if not rank or rank in seen_ranks:
             continue
         seen_ranks.add(rank)
 
@@ -128,18 +132,17 @@ def parse_page(html: str) -> List[Dict]:
     rows.sort(key=lambda r: r["rank"])
     return rows
 
-def fetch_rank160() -> pd.DataFrame:
+def fetch_pass(render_flag: bool, pass_tag: str) -> pd.DataFrame:
     merged: List[Dict] = []
-    for i, url in enumerate(PAGE_URLS, 1):
-        html = scraper_get(url)
+    for idx, url in enumerate(PAGE_URLS, 1):
+        html = scraper_get(url, render=render_flag)
         if SAVE_DEBUG:
-            open(f"data/debug/rakuten_p{i}.html","w",encoding="utf-8").write(html)
+            open(os.path.join(DBG_DIR, f"rakuten_p{idx}_{pass_tag}.html"), "w", encoding="utf-8").write(html)
         merged.extend(parse_page(html))
         time.sleep(0.5)
-    df = pd.DataFrame(merged)
-    return df
+    return pd.DataFrame(merged)
 
-# ---------------- 정규화/안전 처리 ----------------
+# ---------------- 정규화/병합 ----------------
 def extract_int_first(s):
     if pd.isna(s): return np.nan
     m = re.search(r"\d+", str(s)); return int(m.group()) if m else np.nan
@@ -148,23 +151,40 @@ def parse_price_val(s):
     if pd.isna(s): return np.nan
     ds = re.findall(r"\d+", str(s)); return int("".join(ds)) if ds else np.nan
 
-def normalize_top160(df_raw: pd.DataFrame, date_str: str) -> pd.DataFrame:
+def normalize_df(df_raw: pd.DataFrame, date_str: str) -> pd.DataFrame:
     if df_raw.empty: return df_raw
     df = df_raw.copy()
     df.insert(0, "date", date_str)
     df["rank_int"]  = df["rank"].apply(extract_int_first)
     df["price_int"] = df["price"].apply(parse_price_val)
-
-    # 유효 랭크만 (1~160), 랭크 기준 유니크
+    # 1~160만, 랭크 유니크
     df = df[df["rank_int"].between(1, 160, inclusive="both")]
     df = df.sort_values("rank_int").drop_duplicates(subset=["rank_int"], keep="first")
-    # 혹시 더 많아도 절대 160 넘기지 않음
-    df = df.head(160).reset_index(drop=True)
+    return df
 
-    # 최종 CSV 포맷
-    out = df[["date","rank_int","product_name","price_int","url","shop","brand"]].rename(
-        columns={"rank_int":"rank", "price_int":"price"}
-    )
+def merge_best(primary: pd.DataFrame, backup: pd.DataFrame) -> pd.DataFrame:
+    """
+    primary 우선, 부족한 랭크는 backup에서 보충
+    """
+    if primary is None or primary.empty:
+        return backup.copy()
+    if backup is None or backup.empty:
+        return primary.copy()
+
+    A = primary.set_index("rank_int", drop=False)
+    B = backup.set_index("rank_int", drop=False)
+
+    ranks = list(range(1, 161))
+    picked = []
+    for r in ranks:
+        if r in A.index:
+            picked.append(A.loc[r])
+        elif r in B.index:
+            picked.append(B.loc[r])
+    out = pd.DataFrame(picked)
+    out = out.reset_index(drop=True)
+    # 혹시 모를 중복 제거 (rank_int 기준)
+    out = out.drop_duplicates(subset=["rank_int"], keep="first").sort_values("rank_int")
     return out
 
 # ---------------- 번역/슬랙 ----------------
@@ -213,20 +233,32 @@ def build_slack_message(df_today: pd.DataFrame, date_str: str) -> str:
 # ---------------- 메인 ----------------
 def main():
     print("[INFO] 라쿠텐 뷰티 랭킹 수집 시작")
-    raw = fetch_rank160()
-    print(f"[INFO] 원시 수집: {len(raw)} rows")
+    # 1차: render=true
+    p1 = fetch_pass(render_flag=True, pass_tag="r1")
+    p1 = normalize_df(p1, today_str())
 
-    date_s = today_str()
-    top160 = normalize_top160(raw, date_s)
-    print(f"[INFO] 정규화 후: {len(top160)} rows (<=160)")
+    # 2차: render=false (보강)
+    p0 = fetch_pass(render_flag=False, pass_tag="r0")
+    p0 = normalize_df(p0, today_str())
 
-    # CSV 저장
-    fname = FNAME(date_s)
-    top160.to_csv(os.path.join(DATA_DIR, fname), index=False, encoding="utf-8-sig")
+    # 병합 (primary 우선)
+    merged = merge_best(p1, p0)
+
+    # 최종 1~160 고정
+    merged = merged[merged["rank_int"].between(1,160, inclusive="both")]
+    merged = merged.sort_values("rank_int").drop_duplicates(subset=["rank_int"], keep="first").head(160)
+    # 최종 CSV 포맷
+    out = merged[["date","rank_int","product_name","price_int","url","shop","brand"]].rename(
+        columns={"rank_int":"rank","price_int":"price"}
+    ).reset_index(drop=True)
+
+    print(f"[INFO] 최종 건수: {len(out)} (<=160)")
+    fname = FNAME(today_str())
+    out.to_csv(os.path.join(DATA_DIR, fname), index=False, encoding="utf-8-sig")
     print("[INFO] CSV 저장:", fname)
 
-    # Slack (옵션)
-    msg = build_slack_message(top160, date_s)
+    # Slack
+    msg = build_slack_message(out, today_str())
     slack_post(msg)
     print("[INFO] Slack 전송 완료")
 
