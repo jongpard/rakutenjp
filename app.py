@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten JP Beauty(100939) Daily Top N (전문)
-- ScraperAPI(JP, render=true)로 1~160 수집 (p=1,2; 필요시 p=3,4 보정)
-- TOP3 포함 통합 파서
-- rank_int/price_int 정규화 + 안전 비교
+Rakuten JP Beauty(100939) Daily Rank Top-N (Full)
+- ScraperAPI(JP, render=true)로 1~160 수집 (p=1,2; 부족하면 p=3,4 보정)
+- TOP3 포함 통합 파서 (가까운 조상 컨테이너에서 rank/price/shop 추출)
+- rank_int/price_int 정규화 후 모든 집계/정렬
 - CSV + (옵션) Google Drive 업로드
-- Slack: TOP10(ja+ko), 📉급하락, 🔄인&아웃 / 변동 없으면 "(-)"
+- Slack: TOP10(일본어+한국어 1줄), 📉 급하락, 🔄 인&아웃. 변동없음은 "(-)"
+- 전일 CSV가 name/product_name 어떤 형식이든 호환
 """
 
 import os, re, io, time, traceback, datetime as dt
@@ -33,8 +34,8 @@ SAVE_DEBUG   = os.getenv("RAKUTEN_SAVE_DEBUG", "1") in ("1","true","True")
 DO_TRANSLATE = os.getenv("SLACK_TRANSLATE_JA2KO", "1") in ("1","true","True")
 
 BASE = "https://ranking.rakuten.co.jp/daily/100939/"
-BASE_PAGES   = [BASE, BASE + "p=2/"]          # 1~80, 81~160
-BACKUP_PAGES = [BASE + "p=3/", BASE + "p=4/"] # 혹시 누락 시 보정
+PAGES_MAIN   = [BASE, BASE+"p=2/"]         # 1~80, 81~160
+PAGES_BACKUP = [BASE+"p=3/", BASE+"p=4/"]  # 누락 보정
 
 # ===== ScraperAPI =====
 SCRAPER_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
@@ -45,19 +46,21 @@ HEADERS = {
                    "Chrome/120.0.0.0 Safari/537.36"),
     "Accept-Language": "ja,en-US;q=0.9"
 }
-
 def scraperapi_get(url: str, render: bool=True) -> str:
     if not SCRAPER_KEY:
         raise RuntimeError("SCRAPERAPI_KEY 미설정")
-    params = {
-        "api_key": SCRAPER_KEY,
-        "url": url,
-        "country_code": "jp",
-        "retry_404": "true",
-        "keep_headers": "true",
-        "render": "true" if render else "false",
-    }
-    r = requests.get(SCRAPER_ENDPOINT, params=params, headers=HEADERS, timeout=60)
+    r = requests.get(
+        SCRAPER_ENDPOINT,
+        params={
+            "api_key": SCRAPER_KEY,
+            "url": url,
+            "country_code": "jp",
+            "retry_404": "true",
+            "keep_headers": "true",
+            "render": "true" if render else "false",
+        },
+        headers=HEADERS, timeout=60,
+    )
     r.raise_for_status()
     return r.text
 
@@ -77,20 +80,16 @@ def brand_from_shop(shop: str) -> str:
 
 def find_rank_in_block(block: BeautifulSoup) -> Optional[int]:
     if not block: return None
-    # 우선 순위: 특정 클래스
     el = block.select_one(".rnkRanking_dispRank, .rank, .rnkRanking_rank")
     if el:
         m = RANK_TXT_RE.search(el.get_text(" ", strip=True) or "")
         if m: return int(m.group(1))
-    # 블록 전체 텍스트
-    txt = block.get_text(" ", strip=True) if block else ""
+    txt = block.get_text(" ", strip=True)
     m2 = RANK_TXT_RE.search(txt or "")
     if m2: return int(m2.group(1))
-    # 이미지 alt
     img = block.select_one("img[alt*='位']")
     if img:
-        alt = img.get("alt") or ""
-        m3 = RANK_TXT_RE.search(alt)
+        m3 = RANK_TXT_RE.search(img.get("alt") or "")
         if m3: return int(m3.group(1))
     return None
 
@@ -103,102 +102,70 @@ def nearest_item_block(a: BeautifulSoup) -> Optional[BeautifulSoup]:
         cur = cur.parent
     return a.find_parent()
 
-def parse_page(html: str) -> List[Dict]:
+def parse_page(html: str, tag: str) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
     items: List[Dict] = []
-    seen = set()
+    seen_ranks = set()
 
     for a in soup.select("div.rnkRanking_itemName a"):
         block = nearest_item_block(a)
         if not block: continue
-
-        rank = find_rank_in_block(block)
-        if not rank: 
+        rnk = find_rank_in_block(block)
+        if not rnk: continue
+        if rnk in seen_ranks:  # 한 페이지 내 중복 방지
             continue
-        if rank in seen: 
-            continue
-        seen.add(rank)
+        seen_ranks.add(rnk)
 
         name = clean(a.get_text())
-        href = (a.get("href") or "").strip()
-        href = re.sub(r"[?#].*$", "", href)
+        href = re.sub(r"[?#].*$", "", (a.get("href") or "").strip())
 
         pr_el = block.select_one(".rnkRanking_price")
         pr_txt = clean(pr_el.get_text()) if pr_el else ""
-        m_y = YEN_RE.search(pr_txt)
-        price = int(m_y.group(1).replace(",", "")) if m_y else np.nan
+        m = YEN_RE.search(pr_txt)
+        price = m.group(1) if m else ""   # 문자열로 일단 보관(정규화는 후단)
 
         sh_a = block.select_one(".rnkRanking_shop a")
         shop = clean(sh_a.get_text()) if sh_a else ""
         brand = brand_from_shop(shop)
 
-        items.append({
-            "rank": rank, "product_name": name, "price": price,
-            "url": href, "shop": shop, "brand": brand
-        })
+        items.append({"rank": rnk, "product_name": name, "price": price, "url": href, "shop": shop, "brand": brand})
 
-    items.sort(key=lambda r: r["rank"])
-    return items
+    print(f"[Parse] {tag}: {len(items)} rows")
+    return sorted(items, key=lambda r: r["rank"])
 
-def fetch_all() -> pd.DataFrame:
-    rows: List[Dict] = []
-    for url in BASE_PAGES:
-        html = scraperapi_get(url, render=True)
-        if SAVE_DEBUG:
-            tag = "p2" if "p=2" in url else "p1"
-            open(f"{DBG_DIR}/rakuten_{tag}.html", "w", encoding="utf-8").write(html)
-        rows.extend(parse_page(html))
-        time.sleep(0.6)
-
-    # 보정(광고 섞여 누락되는 날 보완)
-    if len({r["rank"] for r in rows}) < 120:
-        for url in BACKUP_PAGES:
-            html = scraperapi_get(url, render=True)
-            if SAVE_DEBUG:
-                tag = "p3" if "p=3" in url else "p4"
-                open(f"{DBG_DIR}/rakuten_{tag}.html", "w", encoding="utf-8").write(html)
-            rows.extend(parse_page(html)); time.sleep(0.6)
-
-    df = pd.DataFrame(rows)
-    return df
-
-# ===== 정규화 유틸 =====
+# ===== 정규화 =====
 def extract_int_first(s):
     if pd.isna(s): return np.nan
     m = re.search(r'\d+', str(s))
     return int(m.group()) if m else np.nan
 
-def parse_price_val(s):
-    if pd.isna(s): return np.nan
-    ds = re.findall(r'\d+', str(s))
-    return int(''.join(ds)) if ds else np.nan
+def to_price_int(x):
+    if pd.isna(x): return np.nan
+    s = str(x).replace(",", "").replace("円", "").replace("～", "").strip()
+    return pd.to_numeric(s, errors="coerce")
 
 def normalize_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
     df = df.copy()
     df.insert(0, "date", date_str)
-    df["rank_int"]  = df["rank"].apply(extract_int_first)
-    df["price_int"] = df["price"].apply(parse_price_val)
-    # 중복 제거 (url이 가장 강한 유니크, 보조로 rank_int)
-    df = df.drop_duplicates(subset=["date", "rank_int", "url"], keep="first")
-    # 유효 랭크만, 상한 적용
+    df["rank"] = df["rank"].astype(str).str.extract(r"(\d+)")
+    df["rank_int"]  = pd.to_numeric(df["rank"], errors="coerce")
+    df["price_int"] = df["price"].apply(to_price_int)
+    # 랭킹 보존을 위해 동일 랭크 중복은 1건만 유지 (url이 다르면 순번이 깨지므로 rank 기준)
+    df = df.drop_duplicates(subset=["date","rank_int"], keep="first")
     df = df[df["rank_int"].notna()].sort_values("rank_int").head(MAX_RANK)
     return df
 
-def get_scalar_int(val):
-    """Series/array/scalar 무엇이 오든 안전하게 int or raise."""
-    if isinstance(val, pd.Series) or isinstance(val, np.ndarray):
-        val = val.iloc[0] if isinstance(val, pd.Series) else val[0]
-    if pd.isna(val): 
-        raise ValueError("NaN rank encountered")
-    return int(val)
+def get_scalar_int(v):
+    if isinstance(v, pd.Series) or isinstance(v, np.ndarray):
+        v = v.iloc[0] if isinstance(v, pd.Series) else v[0]
+    if pd.isna(v): raise ValueError("NaN rank encountered")
+    return int(v)
 
-# ===== 번역 (폴백 안전) =====
+# ===== 번역 =====
 def translate_ja2ko_batch(texts: List[str]) -> List[str]:
-    if not DO_TRANSLATE or not texts: 
+    if not DO_TRANSLATE or not texts:
         return ["" for _ in texts]
-    # 1) googletrans
     try:
         from googletrans import Translator
         tr = Translator(service_urls=['translate.googleapis.com'])
@@ -206,7 +173,6 @@ def translate_ja2ko_batch(texts: List[str]) -> List[str]:
         return [getattr(r, "text", "") or "" for r in (res if isinstance(res, list) else [res])]
     except Exception as e:
         print("[번역 경고] googletrans 실패:", e)
-    # 2) deep-translator
     try:
         from deep_translator import GoogleTranslator
         gt = GoogleTranslator(source="ja", target="ko")
@@ -229,8 +195,7 @@ def slack_post(text: str):
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, list]:
     S = {"top10": [], "falling": [], "inout_count": 0}
-    if df_today.empty: 
-        return S
+    if df_today.empty: return S
 
     name_today = "product_name" if "product_name" in df_today.columns else "name"
     name_prev  = None
@@ -269,17 +234,14 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         if ko[i]: lines.append(f"    ▶ {slack_escape(ko[i])}")
     S["top10"] = lines
 
-    if prev_idx is None: 
-        return S
+    if prev_idx is None: return S
 
     cur_idx = df_today.copy()
     cur_idx["__k__"] = cur_idx[name_today].astype(str).str.strip()
     cur_idx.set_index("__k__", inplace=True)
-
     tN = cur_idx[(cur_idx["rank_int"].notna()) & (cur_idx["rank_int"] <= MAX_RANK)]
-    pN = prev_idx[(prev_idx["rank"].notna())]  # prev는 rank 문자열일 수 있음
+    pN = prev_idx[(prev_idx["rank"].notna())]
 
-    # 공통 키 / OUT 키
     common = set(tN.index) & set(pN.index)
     out_only = set(pN.index) - set(tN.index)
 
@@ -290,16 +252,17 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
             cr = get_scalar_int(tN.loc[k, "rank_int"])
             drop = cr - pr
             if drop > 0:
-                row = tN.loc[k]
-                name_k = k
-                movers.append((drop, cr, pr, f"- {slack_escape(name_k)} {pr}위 → {cr}위 (↓{drop})"))
+                movers.append((drop, cr, pr, f"- {slack_escape(k)} {pr}위 → {cr}위 (↓{drop})"))
         except Exception:
             continue
     movers.sort(key=lambda x: (-x[0], x[1], x[2]))
     chosen = [m[3] for m in movers[:5]]
 
     if len(chosen) < 5:
-        outs = sorted(list(out_only), key=lambda k: extract_int_first(pN.loc[k, "rank"]))
+        def prev_rank_val(key):
+            try: return extract_int_first(pN.loc[key, "rank"])
+            except: return 9999
+        outs = sorted(list(out_only), key=lambda k: prev_rank_val(k))
         for k in outs:
             if len(chosen) >= 5: break
             try:
@@ -307,7 +270,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 chosen.append(f"- {slack_escape(str(k))} {rk}위 → OUT")
             except Exception:
                 pass
-
     S["falling"] = chosen
 
     today_keys = set(tN.index); prev_keys = set(pN.index)
@@ -364,7 +326,28 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
 # ===== 메인 =====
 def main():
     print("[INFO] 라쿠텐 뷰티 랭킹 수집 시작(ScraperAPI, render=true)")
-    raw_df = fetch_all()
+    all_rows: List[Dict] = []
+
+    # 메인 2페이지
+    for url in PAGES_MAIN:
+        html = scraperapi_get(url, render=True)
+        if SAVE_DEBUG:
+            tag = "p2" if "p=2" in url else "p1"
+            open(f"{DBG_DIR}/rakuten_{tag}.html", "w", encoding="utf-8").write(html)
+        all_rows.extend(parse_page(html, tag=("p2" if "p=2" in url else "p1")))
+        time.sleep(0.6)
+
+    # 보정: 수집 랭크 유니크가 120 미만이면 p=3,4도 시도
+    if len({r["rank"] for r in all_rows}) < 120:
+        for url in PAGES_BACKUP:
+            html = scraperapi_get(url, render=True)
+            if SAVE_DEBUG:
+                tag = "p3" if "p=3" in url else "p4"
+                open(f"{DBG_DIR}/rakuten_{tag}.html", "w", encoding="utf-8").write(html)
+            all_rows.extend(parse_page(html, tag=("p3" if "p=3" in url else "p4")))
+            time.sleep(0.6)
+
+    raw_df = pd.DataFrame(all_rows)
     print(f"[INFO] 크롤 수집: {len(raw_df)} rows")
 
     date_str = today()
@@ -372,9 +355,9 @@ def main():
 
     # CSV 저장
     file_today = build_filename(date_str)
-    df_out = df_today[["date","rank_int","product_name","price_int","url","shop","brand"]].rename(columns={
-        "rank_int":"rank","price_int":"price"
-    })
+    df_out = df_today[["date","rank_int","product_name","price_int","url","shop","brand"]].rename(
+        columns={"rank_int":"rank","price_int":"price"}
+    )
     df_out.to_csv(os.path.join(DATA_DIR, file_today), index=False, encoding="utf-8-sig")
     print("[INFO] 로컬 CSV 저장:", file_today)
 
