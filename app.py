@@ -253,9 +253,33 @@ def _js_collect():
 """
 
 def render_and_collect(url: str, expect_count: int, wait_more: bool=False) -> List[Dict]:
-    from playwright.sync_api import sync_playwright
+    """
+    - 단일 셀렉터 고집 대신 '랭킹 컨테이너 후보' + '상품 링크 a' 2단계 대기
+    - 혼잡/점검/봇 검사 문구 감지 시 자동 리로드 (백오프)
+    - 최대 3회 재시도, 실패 시 빈 배열
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    S_CONT = ["#rnkRankingMain", ".rnkRankingMain", ".rnkRanking_box", ".rnkRanking_list"]
+    A_ITEM = 'a[href*="item.rakuten.co.jp/"], a[href*="/item/"]'
+    BAD_PAT = re.compile(r"(アクセスが集中|しばらく経って|ただいま|しばらくお待ち|混雑|ただ今アクセスが集中|お待ちください)")
+
     headless = os.getenv("RAKUTEN_HEADLESS", "1") not in ("0","false","False")
-    slowmo = int(os.getenv("RAKUTEN_SLOWMO_MS","0") or "0")
+    slowmo   = int(os.getenv("RAKUTEN_SLOWMO_MS","0") or "0")
+
+    def _found_container(page) -> bool:
+        for s in S_CONT:
+            try:
+                if page.query_selector(s):
+                    return True
+            except: pass
+        return False
+
+    def _enough_items(page, need:int) -> bool:
+        try:
+            n = page.eval_on_selector_all(A_ITEM, "els => els.length")
+            return n >= need
+        except: return False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -264,76 +288,161 @@ def render_and_collect(url: str, expect_count: int, wait_more: bool=False) -> Li
             slow_mo=slowmo
         )
         ctx = browser.new_context(
-            viewport={"width": 1366, "height": 950},
+            viewport={"width": 1400, "height": 1000},
             locale="ja-JP", timezone_id="Asia/Tokyo",
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"),
-            extra_http_headers={"Accept-Language":"ja,en-US;q=0.9,en;q=0.8,ko;q=0.7"},
+            extra_http_headers={"Accept-Language":"ja,en-US;q=0.9,ko;q=0.8"},
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        try: page.wait_for_load_state("networkidle", timeout=25_000)
-        except: pass
 
-        # 랭킹 컨테이너 뜰 때까지
-        page.wait_for_selector("#rnkRankingMain", timeout=45_000)
+        last_err = None
+        for attempt in range(3):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                try: page.wait_for_load_state("networkidle", timeout=20_000)
+                except PWTimeout: pass
 
-        # 스크롤 다운으로 lazy load 자극
-        def autoscroll(full=False):
-            total = 0
-            step = 800
-            limit = 7000 if not full else 16000
-            while total < limit:
-                page.evaluate("window.scrollBy(0, %d)" % step)
-                total += step
-                time.sleep(0.25)
+                # 혼잡/봇 차단 감지 → 리로드
+                txt_head = page.content()[:8000]
+                if BAD_PAT.search(txt_head):
+                    time.sleep(3 + attempt)
+                    page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    try: page.wait_for_load_state("networkidle", timeout=15_000)
+                    except PWTimeout: pass
 
-        autoscroll(full=True if wait_more else False)
-        try: page.wait_for_load_state("networkidle", timeout=10_000)
-        except: pass
+                # 컨테이너/아이템 등장까지 60s 폴링
+                deadline = time.time() + 60
+                while time.time() < deadline:
+                    if _found_container(page) and _enough_items(page, max(10, expect_count//2)):
+                        break
+                    # 스크롤로 lazy-load 유도
+                    page.evaluate("window.scrollBy(0, 1200)")
+                    time.sleep(0.5)
 
-        # 항목 최소 보장 조건대기
-        try:
-            page.wait_for_function(
-                f"() => (document.querySelectorAll('#rnkRankingMain a[href*=\"item.rakuten.co.jp\"]').length >= {max(10, expect_count//2)})",
-                timeout=25_000
-            )
-        except: pass
+                # 추가 스크롤 (wait_more이면 더 길게)
+                extra_loops = 25 if wait_more else 10
+                for _ in range(extra_loops):
+                    page.evaluate("window.scrollBy(0, 1600)")
+                    time.sleep(0.25)
+                    if _enough_items(page, expect_count): break
 
-        data = page.evaluate(_js_collect())
-        # 디버그 HTML 저장(옵션)
-        try:
-            os.makedirs("data/debug", exist_ok=True)
-            page_content = page.content()
-            tag = "p1" if "p=2" not in url else "p2"
-            with open(f"data/debug/rakuten_{tag}_{int(time.time())}.html","w",encoding="utf-8") as f:
-                f.write(page_content)
-        except: pass
+                data = page.evaluate("""
+                    () => {
+                      const out = [];
+                      const root = document.querySelector('#rnkRankingMain') || document.body;
+                      const cards = root.querySelectorAll('a[href*="item.rakuten.co.jp/"], a[href*="/item/"]');
+                      const seen = new Set();
+                      function rankFrom(el){
+                        let n=el, tries=0;
+                        while(n && tries++<6){
+                          const t=(n.innerText||'').replace(/\\s+/g,' ').trim();
+                          const m=t.match(/(\\d+)位/);
+                          if(m) return parseInt(m[1],10);
+                          n=n.parentElement;
+                        }
+                        return null;
+                      }
+                      function shopFrom(el){
+                        let base = el.closest('li') || el.closest('div') || document.body;
+                        let best = '';
+                        for(const s of base.querySelectorAll('small,span,div,p')){
+                          const t=(s.textContent||'').replace(/\\s+/g,' ').trim();
+                          if(!t) continue;
+                          if(/ショップ|shop|SHOP|ストア|store/i.test(t) || t.length<=20){
+                            if(!best || t.length<best.length) best=t;
+                          }
+                        }
+                        return best;
+                      }
+                      for(const a of cards){
+                        let href=a.href||'';
+                        const name=(a.textContent||'').replace(/\\s+/g,' ').trim();
+                        if(!href || !name) continue;
+                        const r=rankFrom(a); if(!r) continue;
+                        const key=r+'|'+href; if(seen.has(key)) continue; seen.add(key);
+                        const blk=(a.closest('li')||a.closest('div')||document.body).innerText.replace(/\\s+/g,' ').trim();
+                        const shop=shopFrom(a);
+                        out.push({rank:r, name, href, block:blk, shop});
+                      }
+                      return out;
+                    }
+                """)
+
+                # 디버그 HTML 저장
+                try:
+                    os.makedirs("data/debug", exist_ok=True)
+                    tag = "p1" if "p=2" not in url else "p2"
+                    open(f"data/debug/rakuten_{tag}_{int(time.time())}.html","w",encoding="utf-8").write(page.content())
+                except: pass
+
+                ctx.close(); browser.close()
+                return data
+            except Exception as e:
+                last_err = e
+                print(f"[WARN] 렌더 실패: {e}")
+                time.sleep(2+attempt)
+                try: page.close()
+                except: pass
+                page = ctx.new_page()
 
         ctx.close(); browser.close()
-        return data
+        if last_err: raise last_err
+        return []
 
 def fetch_top160() -> List[Dict]:
-    # 1페이지 2회(추가대기 포함) + 2페이지 1회 → 합집합, 랭크 키 기준으로 최신 우선
+    """
+    1페이지를 2회(기본/추가대기) + 2페이지 1회 → 합집합.
+    Playwright가 연속 실패하면 ScraperAPI(render=true)로 폴백.
+    """
     all_rows: Dict[int, Dict] = {}
 
-    # 1~80 (빠짐 방지: 보통 + 추가대기 버전)
-    p1a = render_and_collect(DAILY_URL_P1, expect_count=60, wait_more=False)
-    p1b = render_and_collect(DAILY_URL_P1, expect_count=80, wait_more=True)
-
-    # 81~160
-    p2  = render_and_collect(DAILY_URL_P2, expect_count=80, wait_more=True)
-
-    for arr in (p1a, p1b, p2):
-        for r in arr:
-            rk = int(r.get("rank") or 0)
-            if rk<1 or rk>MAX_RANK: continue
-            all_rows[rk] = r  # 뒤에 온 데이터가 덮어씀(추가대기본 우선)
+    try:
+        p1a = render_and_collect(DAILY_URL_P1, expect_count=60, wait_more=False)
+        p1b = render_and_collect(DAILY_URL_P1, expect_count=80, wait_more=True)
+        p2  = render_and_collect(DAILY_URL_P2, expect_count=80, wait_more=True)
+        for arr in (p1a, p1b, p2):
+            for r in arr:
+                rk = int(r.get("rank") or 0)
+                if 1 <= rk <= MAX_RANK:
+                    all_rows[rk] = r
+    except Exception as e:
+        print("[WARN] Playwright 연속 실패 → ScraperAPI 폴백:", e)
+        key = os.getenv("SCRAPERAPI_KEY","").strip()
+        if not key:
+            raise
+        def _scrape(url, tag):
+            params = {"api_key": key, "url": url, "country_code": "jp", "render": "true", "retry_404":"true"}
+            html = requests.get("https://api.scraperapi.com/", params=params, timeout=60).text
+            open(f"data/debug/{tag}.html","w",encoding="utf-8").write(html)
+            soup = BeautifulSoup(html, "lxml")
+            rows=[]
+            for el in soup.select("li, .rnkRanking_item, .rnkRanking_list li"):
+                rk = el.select_one(".rankNo, .rnkRankBadge, .rnkRanking_rank, .rank, .rnkRanking_dispRank")
+                if not rk: 
+                    # 텍스트 fallback
+                    m=re.search(r"(\d+)\s*位", el.get_text(" ", strip=True))
+                    if m: rank=int(m.group(1))
+                    else: continue
+                else:
+                    m=re.search(r"\d+", rk.get_text(" ", strip=True))
+                    if not m: continue
+                    rank=int(m.group())
+                a = el.select_one("a[href*='item.rakuten.co.jp/'], a[href*='/item/']")
+                if not a: continue
+                href=a.get("href",""); name=clean_text(a.get_text())
+                shop_el = el.select_one(".rnkRanking_shop, .shop, .rnkRanking_shop a")
+                shop = clean_text(shop_el.get_text()) if shop_el else ""
+                rows.append({"rank":rank,"href":href,"name":name,"block":clean_text(el.get_text(' ',strip=True)),"shop":shop})
+            return rows
+        for url, tag in [(DAILY_URL_P1,"rakuten_p1_sa"), (DAILY_URL_P2,"rakuten_p2_sa")]:
+            for r in _scrape(url, tag):
+                rk=int(r["rank"])
+                if 1<=rk<=MAX_RANK:
+                    all_rows[rk]=r
 
     rows = [all_rows[k] for k in sorted(all_rows.keys())]
     return rows[:MAX_RANK]
-
 # ---------- DataFrame 변환 ----------
 def to_dataframe(items: List[Dict], date_str: str) -> pd.DataFrame:
     recs = []
