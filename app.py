@@ -2,16 +2,11 @@
 """
 Rakuten JP Beauty(100939) Daily Rank 1~160
 - ScraperAPI(JP)로 우회, render=False → 0개면 True 재시도(크레딧 절약)
-- 파싱: div.rnkRanking_after4box 기준 (rank/name/url/price/shop/brand)
-- CSV 저장: 라쿠텐재팬_뷰티_랭킹_YYYY-MM-DD.csv
-- (옵션) Google Drive 업로드 + 전일 비교로 Slack 메시지 전송
-- 변동이 없으면 "-" 로 표기
-
-필수 env:
-  SCRAPERAPI_KEY, SLACK_WEBHOOK_URL,
-  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
-옵션 env:
-  RAKUTEN_MAX_RANK(기본 160), RAKUTEN_FORCE_RENDER(기본 0), RAKUTEN_SAVE_DEBUG(기본 1)
+- 파싱: div.rnkRanking_after4box (rank / product_name / price / url / shop / brand)
+- CSV: 라쿠텐재팬_뷰티_랭킹_YYYY-MM-DD.csv
+- (옵션) Google Drive 업로드 + 전일 비교 Slack 리포트
+- 변동 없으면 '-' 표기
+- 전일 CSV가 'name' 헤더여도 자동 호환
 """
 
 import os, re, io, time, traceback, datetime as dt
@@ -21,7 +16,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# ===== 기본 =====
+# ===== 공통 =====
 KST = dt.timezone(dt.timedelta(hours=9))
 def now_kst(): return dt.datetime.now(KST)
 def today(): return now_kst().strftime("%Y-%m-%d")
@@ -37,7 +32,6 @@ MAX_RANK = int(os.getenv("RAKUTEN_MAX_RANK", "160"))
 FORCE_RENDER = os.getenv("RAKUTEN_FORCE_RENDER", "0") in ("1","true","True")
 SAVE_DEBUG   = os.getenv("RAKUTEN_SAVE_DEBUG", "1") in ("1","true","True")
 
-# 대상 페이지(1~80, 81~160)
 RANK_URLS = [
     "https://ranking.rakuten.co.jp/daily/100939/",
     "https://ranking.rakuten.co.jp/daily/100939/p=2/",
@@ -118,14 +112,12 @@ def fetch_all() -> List[Dict]:
     allrows: List[Dict] = []
     for url in RANK_URLS:
         add = 80 if "p=2" in url else 0
-        # 1차: render=False(절약) or 강제 설정
         render_first = True if FORCE_RENDER else False
         html = scraperapi_get(url, render=render_first)
         if SAVE_DEBUG:
             open(f"{DBG_DIR}/rakuten_{'p2' if add else 'p1'}_raw_{'r1' if render_first else 'r0'}.html","w",encoding="utf-8").write(html)
         rows = parse_rank_page(html, add)
         if len(rows) == 0 and not render_first:
-            # 2차: 해당 페이지만 렌더 ON 재시도
             html = scraperapi_get(url, render=True)
             if SAVE_DEBUG:
                 open(f"{DBG_DIR}/rakuten_{'p2' if add else 'p1'}_raw_r1.html","w",encoding="utf-8").write(html)
@@ -149,22 +141,30 @@ def slack_post(text: str):
         print("[Slack 예외]", e)
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, list]:
+    """전일 CSV가 name/product_name 어느 쪽이든 호환."""
     S = {"top10": [], "falling": [], "inout_count": 0}
-    if "rank" not in df_today.columns or len(df_today) == 0:
+    if len(df_today) == 0:
         return S
 
+    # 제품명 컬럼 자동 선택
+    name_col_today = "product_name" if "product_name" in df_today.columns else "name"
+    name_col_prev  = None
+    if df_prev is not None and len(df_prev):
+        if "product_name" in df_prev.columns: name_col_prev = "product_name"
+        elif "name" in df_prev.columns: name_col_prev = "name"
+
     def _name(r):
-        nm = clean(r.get("product_name",""))
-        br = clean(r.get("brand",""))
+        nm = clean(r.get(name_col_today, ""))
+        br = clean(r.get("brand", ""))
         return f"{br} {nm}" if br and not nm.lower().startswith(br.lower()) else nm
 
     def _link(r):
         return f"<{r['url']}|{slack_escape(_name(r))}>" if r.get("url") else slack_escape(_name(r))
 
     prev_idx = None
-    if df_prev is not None and len(df_prev) and "rank" in df_prev.columns:
+    if name_col_prev:
         prev_idx = df_prev.copy()
-        prev_idx["__k__"] = prev_idx["product_name"].astype(str).str.strip()
+        prev_idx["__k__"] = prev_idx[name_col_prev].astype(str).str.strip()
         prev_idx.set_index("__k__", inplace=True)
 
     # TOP10
@@ -173,7 +173,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     for _, r in top10.iterrows():
         mark = ""
         if prev_idx is not None:
-            k = str(r.get("product_name")).strip()
+            k = str(r.get(name_col_today)).strip()
             if k in prev_idx.index and pd.notnull(prev_idx.loc[k, "rank"]):
                 pr = int(prev_idx.loc[k, "rank"]); cr = int(r["rank"])
                 diff = pr - cr
@@ -190,7 +190,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         return S
 
     cur_idx = df_today.copy()
-    cur_idx["__k__"] = cur_idx["product_name"].astype(str).str.strip()
+    cur_idx["__k__"] = cur_idx[name_col_today].astype(str).str.strip()
     cur_idx.set_index("__k__", inplace=True)
 
     tN = cur_idx[(cur_idx["rank"].notna()) & (cur_idx["rank"] <= MAX_RANK)]
@@ -300,14 +300,14 @@ def main():
             drive_upload_csv(svc, folder, file_today, df_today)
             y_name = build_filename(yesterday())
             df_prev = drive_download_csv(svc, folder, y_name)
-            print("[INFO] 드라이브 업로드 OK, 전일:", "있음" if df_prev is not None else "없음")
+            print("[INFO] 드라이브 업로드 OK, 전일:", "있음" if (df_prev is not None and not df_prev.empty) else "없음")
         except Exception as e:
             print("[Drive 오류]", e); traceback.print_exc()
     else:
         print("[INFO] GDRIVE_FOLDER_ID 미설정 → 업로드 생략")
 
-    # Slack
-    S = build_sections(df_today, df_prev)
+    # Slack 리포트
+    S = build_sections(df_today, df_prev if (df_prev is not None and not df_prev.empty) else None)
     slack_post(build_slack_message(date_str, S))
     print("[INFO] Slack 전송 완료")
 
