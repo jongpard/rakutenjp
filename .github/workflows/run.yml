@@ -17,18 +17,22 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
+
+      # 동작 옵션
       RAKUTEN_MAX_RANK: "160"
       SLACK_TRANSLATE_JA2KO: "1"
+      RAKUTEN_HEADLESS: "1"          # 필요 시 0으로 두면 브라우저 창 동작 확인 가능
+      RAKUTEN_SLOWMO_MS: "0"         # 디버깅용 딜레이(ms)
 
-      # Secrets
-      SCRAPERAPI_KEY:    ${{ secrets.SCRAPERAPI_KEY }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # 시크릿(옵션/필수 혼합)
+      SCRAPERAPI_KEY:       ${{ secrets.SCRAPERAPI_KEY }}     # 옵션(폴백용)
+      SLACK_WEBHOOK_URL:    ${{ secrets.SLACK_WEBHOOK_URL }}  # 슬랙 전송용
       GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
       GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
-      NAVER_CLIENT_ID:      ${{ secrets.NAVER_CLIENT_ID }}
-      NAVER_CLIENT_SECRET:  ${{ secrets.NAVER_CLIENT_SECRET }}
+      NAVER_CLIENT_ID:      ${{ secrets.NAVER_CLIENT_ID }}    # (미사용) 남겨둠
+      NAVER_CLIENT_SECRET:  ${{ secrets.NAVER_CLIENT_SECRET }} # (미사용) 남겨둠
 
     steps:
       - name: Checkout
@@ -39,13 +43,37 @@ jobs:
         with:
           python-version: "3.10"
 
+      # pip 캐시(선택)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml pandas
+          # 기본 라이브러리
+          pip install requests beautifulsoup4 lxml pandas pytz
+          # 번역 모듈 (큐텐 스타일)
+          pip install googletrans==4.0.0rc1 deep-translator
+          # 구글 드라이브
+          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          # Playwright + 브라우저
           pip install playwright
           python -m playwright install --with-deps chromium
-          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+
+      - name: Preflight (optional)
+        run: |
+          echo "== ENV check =="
+          python - <<'PY'
+          import os
+          for k in ["SLACK_WEBHOOK_URL","GDRIVE_FOLDER_ID","GOOGLE_CLIENT_ID","SCRAPERAPI_KEY"]:
+              v = os.getenv(k)
+              print(f"{k:22}:", "SET" if v else "MISSING")
+          PY
 
       - name: Run rakuten app.py
         run: |
@@ -59,6 +87,7 @@ jobs:
           name: csv-${{ github.run_id }}
           path: data/*.csv
           if-no-files-found: warn
+          compression-level: 6
 
       - name: Upload debug files (optional)
         if: always()
@@ -67,3 +96,4 @@ jobs:
           name: debug-${{ github.run_id }}
           path: data/debug/**
           if-no-files-found: warn
+          compression-level: 6
